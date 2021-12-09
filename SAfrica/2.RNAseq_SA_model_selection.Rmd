@@ -1,0 +1,362 @@
+---
+title: "RNA-seq model selection"
+subtitle: "South Africa: TB-induced RSTR vs LTBI"
+author: "Kim Dill-McFarland, kadm@uw.edu"
+date: "version `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+editor_options:
+  chunk_output_type: console
+---
+# Background
+
+The purpose of this workflow is to determine co-variates to include in DEG analysis.
+
+# Setup
+Load packages
+
+```{r message=FALSE, warning=FALSE}
+# Data manipulation and figures
+library(tidyverse)
+    # Multi-panel figures for ggplot
+    library(cowplot)
+library(venn)
+library(biomaRt)
+# Print tty table to knit file
+library(knitr)
+library(kableExtra)
+
+`%notin%` <- Negate(`%in%`)
+```
+
+Set seed
+
+```{r}
+set.seed(4389)
+```
+
+# Customization
+
+Set variable names and cutoffs for this workflow.
+
+```{r}
+#Rdata file WITHIN project directory that holds cleaned data
+data.file <- "data_clean/RSTR_SA_dat_clean.RData"
+
+#Prefix to give file names
+basename <- "SA_RSTR.Mtb"
+#Define variable(s) of interest
+#Used in PCA plots and to select significant genes to be used in module building
+vars_of_interest <- c("condition", "Sample_Group")
+```
+
+# Load data
+
+```{r}
+#Load data
+load(data.file)
+```
+
+This includes in the following samples.
+
+```{r echo=FALSE}
+dat.abund.norm.voom$targets %>% 
+  group_by_at(vars(vars_of_interest)) %>% 
+  tally() %>% 
+  
+  kable(align="c") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+# Data exploration
+## PCA
+### Main variables
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Calculate PCA
+PCA.all <- as.data.frame(dat.abund.norm.voom$E) %>% 
+  t() %>% 
+  prcomp()
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#Get XY labels
+PCA.labs <- list()
+PCA.labs[1] <- paste("PC1 (", summary(PCA.all)$importance[2,1]*100, 
+                               "%)", sep="")
+PCA.labs[2] <- paste("PC2 (", summary(PCA.all)$importance[2,2]*100, 
+                               "%)", sep="")
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Extract PC values and combine
+PCA.dat.all <- as.data.frame(PCA.all$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs
+  dplyr::select(libID, PC1:PC3) %>% 
+  #Add metadata
+  left_join(dat.abund.norm.voom$targets)
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#plots
+PCA.list <- list()
+#Loop through variables of interest
+for(i in 1:length(vars_of_interest)){
+  PCA <- PCA.dat.all %>% 
+
+    ggplot(aes(PC1, PC2)) +
+      geom_point(aes_string(color=vars_of_interest[i]),
+                      size=3) +
+      #Beautify
+      theme_classic() +
+      labs(x=PCA.labs[[1]], y=PCA.labs[[2]], 
+           title="voom normalized\nabundant logCPM",
+           color=vars_of_interest[i]) +
+      coord_fixed(ratio=1) +
+      guides(color=guide_legend(title.position="top", 
+                                title.hjust = 0.5))
+ PCA.list[[i]] <- PCA
+}
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=12}
+plot_grid(plotlist=PCA.list, ncol=2)
+
+dir.create("figs", showWarnings = FALSE)
+ggsave("figs/PCA_SA_RSTR.Mtb_geneVoom.png", 
+       plot_grid(plotlist=PCA.list, ncol=2),
+       height=6, width=8)
+```
+
+### Potential co-variates
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#plots
+PCA.list <- list()
+#Loop through variables of interest
+for(covar in c("age","gender","bmi","bcgscar",
+               "HoursWorkedUnderground","YearsWorkedUnderground")){
+
+  PCA <- PCA.dat.all %>% 
+    arrange(desc(covar)) %>% 
+    
+    ggplot(aes(PC1, PC2)) +
+      geom_point(aes_string(color=covar),
+                      size=3) +
+      #Beautify
+      theme_classic() +
+      labs(x=PCA.labs[[1]], y=PCA.labs[[2]], 
+           title="voom normalized\nabundant logCPM",
+           color=gsub("_","\n",covar)) +
+      coord_fixed(ratio=1) +
+      guides(color=guide_legend(title.position="top", 
+                                title.hjust = 0.5))
+ PCA.list[[covar]] <- PCA
+}
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=30, fig.width=8.5}
+plot_grid(plotlist=PCA.list, ncol=2)
+
+ggsave("figs/PCA_SA_RSTR.Mtb_covar.png", 
+       plot_grid(plotlist=PCA.list, ncol=2),
+       height=10, width=8)
+```
+
+# Interaction models 
+## Linear mixed effects models 
+
+```{r}
+source("scripts/kin.model.fxn.R")
+```
+
+```{r eval=FALSE}
+lmekin.loop(dat = dat.abund.norm.voom, kin = NULL, 
+             x.var = c("condition","Sample_Group"), ptID="FULLIDNO",
+             co.var=c("age"), 
+             interaction=TRUE, 
+             lm=FALSE, lme=TRUE,
+             outdir="results/gene_level/", name="SA_RSTR.interaction_age",
+             processors=5, p.method="BH")
+
+lmekin.loop(dat = dat.abund.norm.voom, kin = NULL, 
+             x.var = c("condition","Sample_Group"), ptID="FULLIDNO",
+             interaction=TRUE, 
+             lm=FALSE, lme=TRUE,
+             outdir="results/model_selection/", name="SA_RSTR.interaction",
+             processors=5, p.method="BH")
+```
+
+```{r message=FALSE}
+model.files <- list.files(path="results/model_selection/", pattern="results.csv.gz",
+                          full.names = TRUE)
+#load results
+gene_pval <- data.frame()
+
+for(filename in model.files){
+  gene_pval <- read_csv(filename) %>% 
+    bind_rows(gene_pval)
+}
+```
+
+Format model result labels
+
+```{r}
+gene_pval_all <- gene_pval %>% 
+  mutate(coVar = recode_factor(factor(group), "SA_RSTR.interaction"="none",
+                               "SA_RSTR.interaction_age"="age"))
+```
+
+## Model fits (sigma)
+#### Age
+
+```{r echo=FALSE}
+gene_pval_all %>% 
+  distinct(coVar, gene, sigma) %>% 
+  pivot_wider(names_from = coVar, values_from = sigma) %>% 
+  
+  ggplot(aes(x=age, y=none)) +
+  geom_point() +
+  geom_abline(slope=1, intercept=0, color="red") +
+  theme_classic() +
+  labs(x="~ Mtb * RSTR + age",
+       y="~ Mtb * RSTR",
+       title="Model fit (sigma)")
+```
+
+```{r echo=FALSE}
+gene_pval_all %>% 
+  distinct(coVar, gene, sigma) %>% 
+  pivot_wider(names_from = coVar, values_from = sigma) %>% 
+  mutate(best = ifelse(none<age, "none", 
+                       ifelse(age<none, "age", NA)),
+         diff = abs(none-age)) %>% 
+  group_by(best) %>% 
+  summarise(n=n(),
+            mean.diff = mean(diff), .groups="drop") %>% 
+
+  kable(col.names = c("Co-variates", "Number of genes best fit", 
+                      "Mean difference in sigma")) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)%>% 
+  collapse_rows(1, valign="top")
+```
+
+The best fit model with or without age is split by genes.
+
+## Significant genes
+
+```{r echo=FALSE}
+fdr.cutoff <- 0.2
+```
+
+```{r echo=FALSE, fig.width=8.5, fig.height=4}
+par(mfrow=c(1,2))
+for(co.var in levels(gene_pval_all$coVar)){
+venn.ls <- list()
+
+pval.temp <- gene_pval_all %>% 
+  filter(coVar == co.var & FDR <= fdr.cutoff)
+
+if(nrow(pval.temp)>0){
+venn.ls[["+Mtb vs media\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & !grepl("Sample_Group",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["RSTR vs LTBI\nexpression"]] <- pval.temp %>% 
+  filter(grepl("Sample_Group", variable) & !grepl("condition",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Interaction\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & grepl("Sample_Group", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Age"]] <- pval.temp %>%
+  filter(grepl("age", variable)) %>%
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn(ilab=FALSE, zcolor = "style",ilcs=1, sncs=1,
+     x=venn.ls, box=FALSE)
+  
+  title(sub=paste(co.var, "\nFDR <", fdr.cutoff, sep=" "), 
+        line = -1, cex.sub=1.5)
+}
+}
+```
+
+```{r echo=FALSE}
+png(filename="results/model_selection/SA_model_venn_compare.png",
+    width=10, height=5, units = "in", res=150)
+
+par(mfrow=c(1,2))
+for(co.var in levels(gene_pval_all$coVar)){
+venn.ls <- list()
+
+pval.temp <- gene_pval_all %>% 
+  filter(coVar == co.var & FDR <= fdr.cutoff)
+
+if(nrow(pval.temp)>0){
+venn.ls[["+Mtb vs media\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & !grepl("Sample_Group",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["RSTR vs LTBI\nexpression"]] <- pval.temp %>% 
+  filter(grepl("Sample_Group", variable) & !grepl("condition",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Interaction\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & grepl("Sample_Group", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Age"]] <- pval.temp %>%
+  filter(grepl("age", variable)) %>%
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn(ilab=FALSE, zcolor = "style",ilcs=1, sncs=1,
+     x=venn.ls, box=FALSE)
+  
+  title(sub=paste(co.var, "\nFDR <", fdr.cutoff, sep=" "), 
+        line = -1, cex.sub=1.5)
+}
+}
+
+dev.off()
+```
+
+DEGs (significant for interaction or RSTR)
+
+```{r echo=FALSE}
+temp <- gene_pval_all %>% 
+  filter(grepl("Sample_Group", variable) & FDR <= fdr.cutoff) %>% 
+  distinct(gene, model, coVar) %>% 
+  count( model,coVar) %>% 
+  rename(Total=n)
+
+gene_pval_all %>% 
+  filter(grepl("Sample_Group", variable) & FDR <= fdr.cutoff) %>% 
+  mutate(variable = recode_factor(factor(variable),
+                           "conditionTB:Sample_GroupRSTR"="Mtb:RSTR interaction",
+                           "condition:Sample_Group"="Mtb:RSTR interaction",
+                           "Sample_Group"="RSTR",
+                           "Sample_GroupRSTR"="RSTR")) %>% 
+  count(model, coVar, variable) %>% 
+  pivot_wider(names_from = variable, values_from = n) %>% 
+  mutate(RSTR = ifelse(is.na(RSTR), 0, RSTR)) %>% 
+  full_join(temp) %>% 
+
+kable(align="c") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  collapse_rows(1:3, valign="top") %>% 
+  add_header_above(c(" "=2, "DEG FDR < 0.2"=3))
+```
+
+# R session
+
+```{r}
+sessionInfo()
+```
+
+***

@@ -1,0 +1,617 @@
+---
+title: "RNA-seq model selection"
+subtitle: "Uganda: TB-induced RSTR vs LTBI"
+author: "Kim Dill-McFarland, kadm@uw.edu"
+date: "version `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+editor_options:
+  chunk_output_type: console
+---
+# Background
+
+The purpose of this workflow is to determine co-variates to include in DEG analysis.
+
+# Setup
+Load packages
+
+```{r message=FALSE, warning=FALSE}
+# Data manipulation and figures
+library(tidyverse)
+    # Multi-panel figures for ggplot
+    library(cowplot)
+library(venn)
+library(biomaRt)
+# Print tty table to knit file
+library(knitr)
+library(kableExtra)
+
+`%notin%` <- Negate(`%in%`)
+```
+
+Set seed
+
+```{r}
+set.seed(4389)
+```
+
+# Customization
+
+Set variable names and cutoffs for this workflow.
+
+```{r}
+#Rdata file WITHIN project directory that holds cleaned data
+data.file <- "data_clean/RSTR_RNAseq_data_combined_uniqueFULLID.RData"
+
+#Prefix to give file names
+basename <- "RSTR.Mtb"
+#Define variable(s) of interest
+#Used in PCA plots and to select significant genes to be used in module building
+vars_of_interest <- c("condition", "Sample_Group")
+```
+
+# Load data
+
+```{r}
+#Load data
+load(data.file)
+```
+
+This includes in the following samples.
+
+```{r echo=FALSE}
+dat.combined.voom$targets %>% 
+  group_by_at(vars(vars_of_interest)) %>% 
+  tally() %>% 
+  
+  kable(align="c") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+#### Kinship
+
+```{r}
+kin <- read_csv("data_raw/kinship_Hawn_all.csv")
+
+overlap <- intersect(kin$rowname, meta.combined$FULLIDNO)
+
+kin <- kin %>% 
+  filter(rowname %in% overlap) %>% 
+  dplyr::select(rowname, all_of(overlap)) %>% 
+  arrange(rowname) %>% 
+  column_to_rownames()
+
+#Subset RNAseq data
+dat.combined.voom.kin <- dat.combined.voom
+dat.combined.voom.kin$targets <- dat.combined.voom.kin$targets %>% 
+  filter(FULLIDNO %in% overlap)
+dat.combined.voom.kin$E <- dat.combined.voom.kin$E %>% 
+  dplyr::select(all_of(c(dat.combined.voom.kin$targets$libID)))
+```
+
+Thus, kinship models include the following samples.
+
+```{r echo=FALSE}
+dat.combined.voom.kin$targets %>% 
+  group_by_at(vars(vars_of_interest)) %>% 
+  tally() %>% 
+  
+  kable(align="c") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+# Data exploration
+## PCA
+### Main variables
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Calculate PCA
+PCA.all <- as.data.frame(dat.combined.voom$E) %>% 
+  t() %>% 
+  prcomp()
+
+PCA.kin <- as.data.frame(dat.combined.voom.kin$E) %>% 
+  t() %>% 
+  prcomp()
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#Get XY labels
+PCA.labs <- list()
+
+for(PCA.dat in c("PCA.all", "PCA.kin")){
+  PCA.labs[[paste(PCA.dat,1,sep="_")]] <- paste("PC1 (",
+                               summary(get(PCA.dat))$importance[2,1]*100, 
+                               "%)", sep="")
+  PCA.labs[[paste(PCA.dat,2,sep="_")]] <- paste("PC2 (",
+                               summary(get(PCA.dat))$importance[2,2]*100, 
+                               "%)", sep="")
+}
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Extract PC values and combine
+PCA.dat.all <- data.frame()
+for(PCA.dat in c("PCA.all", "PCA.kin")){
+PCA.dat.temp <- as.data.frame(get(PCA.dat)$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs
+  dplyr::select(libID, PC1:PC3) %>% 
+  mutate(data=PCA.dat)
+
+PCA.dat.all <- bind_rows(PCA.dat.all, PCA.dat.temp)
+}
+
+#Add metadata
+PCA.dat.all <- PCA.dat.all %>% 
+  left_join(dat.combined.voom$targets)
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#plots
+PCA.list <- list()
+#Loop through variables of interest
+for(i in 1:length(vars_of_interest)){
+  for(PCA.dat in c("PCA.all", "PCA.kin")){
+  PCA.labs.temp <- PCA.labs[grepl(PCA.dat, names(PCA.labs))]
+  
+  PCA <- PCA.dat.all %>% 
+    filter(data == PCA.dat) %>% 
+    
+    ggplot(aes(PC1, PC2)) +
+      geom_point(aes_string(color=vars_of_interest[i]),
+                      size=3) +
+      #Beautify
+      theme_classic() +
+      labs(x=PCA.labs.temp[1], y=PCA.labs.temp[2], 
+           title=paste("voom normalized\nabundant logCPM\n", 
+                       PCA.dat),
+           color=vars_of_interest[i]) +
+      coord_fixed(ratio=1) +
+      guides(color=guide_legend(title.position="top", 
+                                title.hjust = 0.5))
+ PCA.list[[paste(i, PCA.dat, sep="_")]] <- PCA
+}}
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=12}
+plot_grid(plotlist=PCA.list, ncol=2)
+
+dir.create("figs", showWarnings = FALSE)
+ggsave("figs/PCA_RSTR.Mtb_geneVoom.png", 
+       plot_grid(plotlist=PCA.list, ncol=2),
+       height=8, width=8)
+```
+
+### Potential co-variates
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+#plots
+PCA.list <- list()
+#Loop through variables of interest
+for(covar in c("KCHCA_AGE_YR_CURRENT","M0_KCVSEX","avgBMI",
+               "RISK_SCORE","KCB_BCGSCAR")){
+  for(PCA.dat in c("PCA.all", "PCA.kin")){
+  PCA.labs.temp <- PCA.labs[grepl(PCA.dat, names(PCA.labs))]
+  
+  PCA <- PCA.dat.all %>% 
+    filter(data == PCA.dat) %>% 
+    arrange(desc(covar)) %>% 
+    
+    ggplot(aes(PC1, PC2)) +
+      geom_point(aes_string(color=covar),
+                      size=3) +
+      #Beautify
+      theme_classic() +
+      labs(x=PCA.labs.temp[1], y=PCA.labs.temp[2], 
+           title=paste("voom normalized\nabundant logCPM\n", 
+                       PCA.dat),
+           color=gsub("_","\n",covar)) +
+      coord_fixed(ratio=1) +
+      guides(color=guide_legend(title.position="top", 
+                                title.hjust = 0.5))
+ PCA.list[[paste(covar, PCA.dat, sep="_")]] <- PCA
+}}
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=30, fig.width=8.5}
+plot_grid(plotlist=PCA.list, ncol=2)
+
+ggsave("figs/PCA_RSTR.Mtb_covar.png", 
+       plot_grid(plotlist=PCA.list, ncol=2),
+       height=20, width=8)
+```
+
+# Interaction models 
+## Linear mixed effects models 
+
+```{r}
+source("scripts/kin.model.fxn.R")
+```
+
+### Samples with kinship
+
+```{r eval=FALSE}
+lmekin.loop(dat = dat.combined.voom, kin = kin, 
+             x.var = c("condition","Sample_Group"), ptID="FULLIDNO",
+             co.var=c("KCHCA_AGE_YR_CURRENT","M0_KCVSEX","experiment"), 
+             interaction=TRUE, 
+             lm=FALSE, lme=TRUE,
+             outdir="results/model_selection/",
+             name="RSTR.interaction_age.sex.batch",
+             processors=5, p.method="BH")
+
+lmekin.loop(dat = dat.combined.voom, kin = kin, 
+             x.var = c("condition","Sample_Group"), ptID="FULLIDNO",
+             co.var=c("M0_KCVSEX","experiment"), 
+             interaction=TRUE, 
+             lm=FALSE, lme=TRUE,
+             outdir="results/model_selection/",
+             name="RSTR.interaction_sex.batch",
+             processors=5, p.method="BH")
+
+lmekin.loop(dat = dat.combined.voom, kin = kin, 
+             x.var = c("condition","Sample_Group"), ptID="FULLIDNO",
+             co.var=c("experiment"), 
+             interaction=TRUE, 
+             lm=FALSE, lme=TRUE,
+             outdir="results/model_selection/", 
+             name="RSTR.interaction_batch",
+             processors=5, p.method="BH")
+```
+
+```{r message=FALSE}
+model.files <- list.files(path="results/model_selection", full.names = TRUE,)
+model.files <- model.files[grepl("batch.model.results.csv.gz", model.files)]
+#load results
+gene_pval <- data.frame()
+
+for(filename in model.files){
+  gene_pval <- read_csv(filename) %>% 
+    bind_rows(gene_pval)
+}
+```
+
+Format model result labels
+
+```{r}
+gene_pval_all <- gene_pval%>% 
+  mutate(CHR = "allCHR", samples="kinSAMPLE") %>% 
+  mutate(coVar = gsub("RSTR.interaction_","", group),
+         coVar = gsub("_all","", coVar)) %>% 
+  mutate(coVar = factor(coVar, levels =c("age.sex.batch","sex.batch","batch")))
+```
+
+## Model fits (sigma)
+
+Compare models from the same sample set, including only samples with RNA-seq and kinship data (N = `r length(overlap)`).
+
+#### Kinship
+
+```{r echo=FALSE}
+gene_pval_all %>% 
+  filter(samples=="kinSAMPLE") %>% 
+  distinct(model,CHR, coVar, gene, sigma) %>% 
+  pivot_wider(names_from = model, values_from = sigma) %>% 
+  ggplot(aes(x=lme, y=lmekin)) +
+  geom_point() +
+  geom_abline(slope=1, intercept=0, color="red") +
+  facet_grid(CHR~coVar) + 
+  theme_classic() +
+  labs(x="LME",
+       y="LMEKIN",
+       title="Model fit (sigma)")
+```
+
+```{r echo=FALSE}
+gene_pval_all %>% 
+  filter(samples=="kinSAMPLE") %>% 
+  distinct(model, CHR, coVar, gene, sigma) %>% 
+  pivot_wider(names_from = model, values_from = sigma) %>% 
+  mutate(best = ifelse(lme<lmekin, "lme", 
+                       ifelse(lmekin<lme, "lmekin", NA)),
+         diff = abs(lme-lmekin)) %>% 
+  group_by(coVar, CHR, best) %>% 
+  summarise(n=n(),
+            mean.diff = mean(diff), .groups="drop") %>% 
+
+  kable(col.names = c("Co-variates", "CHR", 
+                      "Model","Number of genes best fit", 
+                      "Mean difference in sigma")) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  collapse_rows(1, valign="top")
+```
+
+Overall fits are similar between models with and without kinship correction, as seen by values along the 1:1 line. However, the majority of genes are better fit to a small degree (lower sigma) by the kinship model.
+
+#### Age
+
+```{r echo=FALSE}
+gene_pval_all %>% 
+  filter(model=="lmekin") %>% 
+  distinct(CHR, coVar, gene, sigma) %>% 
+  pivot_wider(names_from = coVar, values_from = sigma) %>% 
+  
+  ggplot(aes(x=sex.batch, y=age.sex.batch)) +
+  geom_point() +
+  geom_abline(slope=1, intercept=0, color="red") +
+  facet_wrap(~CHR) + 
+  theme_classic() +
+  labs(x="~ Mtb * RSTR + sex + batch + kinship",
+       y="~ Mtb * RSTR + age + sex + batch + kinship",
+       title="Model fit (sigma)")
+```
+
+```{r echo=FALSE}
+gene_pval_all %>% 
+  filter(model=="lmekin") %>% 
+  distinct(CHR, coVar, gene, sigma) %>% 
+  pivot_wider(names_from = coVar, values_from = sigma) %>% 
+  mutate(best = ifelse(sex.batch<age.sex.batch, "sex.batch", 
+                       ifelse(age.sex.batch<sex.batch, "age.sex.batch", NA)),
+         diff = abs(sex.batch-age.sex.batch)) %>% 
+  group_by(CHR, best) %>% 
+  summarise(n=n(),
+            mean.diff = mean(diff), .groups="drop") %>% 
+
+  kable(col.names = c("CHR", "Co-variates", "Number of genes best fit", 
+                      "Mean difference in sigma")) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)%>% 
+  collapse_rows(1, valign="top")
+```
+
+The best fit model with or without age is split by genes.
+
+#### Sex
+
+```{r echo=FALSE}
+gene_pval_all %>% 
+  filter(model=="lmekin") %>% 
+  distinct(CHR, coVar, gene, sigma) %>% 
+  pivot_wider(names_from = coVar, values_from = sigma) %>% 
+  
+  ggplot(aes(x=batch, y=sex.batch)) +
+  geom_point() +
+  geom_abline(slope=1, intercept=0, color="red") +
+  facet_wrap(~CHR) + 
+  theme_classic() +
+  labs(x="~ Mtb * RSTR + batch + kinship",
+       y="~ Mtb * RSTR + sex + batch + kinship",
+       title="Model fit (sigma)")
+```
+
+```{r echo=FALSE}
+gene_pval_all %>% 
+  filter(model=="lmekin") %>% 
+  distinct(CHR, coVar, gene, sigma) %>% 
+  pivot_wider(names_from = coVar, values_from = sigma) %>% 
+  mutate(best = ifelse(batch<sex.batch, "batch", 
+                       ifelse(sex.batch<batch, "sex.batch", NA)),
+         diff = abs(batch-sex.batch)) %>% 
+  group_by(CHR, best) %>% 
+  summarise(n=n(),
+            mean.diff = mean(diff), .groups="drop") %>% 
+
+  kable(col.names = c("CHR", "Co-variates", "Number of genes best fit", 
+                      "Mean difference in sigma")) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)%>% 
+  collapse_rows(1, valign="top")
+```
+
+Similarly, there is variability in best fit with and without sex.
+
+## Significant genes
+
+```{r echo=FALSE}
+fdr.cutoff <- 0.2
+```
+
+Compare models from the maximum sample sets. Kinship models contain `r length(overlap)` individuals while non-kinship contain `r length(unique(dat.combined.voom$targets$FULLIDNO))`. Age is significant for `r length(unique(filter(gene_pval_all, FDR <= fdr.cutoff & grepl("AGE", variable))$gene))` genes. Thus, age is not included in venns.
+
+```{r echo=FALSE, fig.width=8.5, fig.height=4}
+for(samp in unique(gene_pval_all$samples)){
+for(kin in unique(gene_pval_all$model)){
+  par(mfrow=c(1,3))
+for(sub.set in unique(gene_pval_all$CHR)){
+for(co.var in levels(gene_pval_all$coVar)){
+venn.ls <- list()
+
+pval.temp <- gene_pval_all %>% 
+  filter(model==kin & coVar == co.var & CHR == sub.set & samples == samp &
+           FDR <= fdr.cutoff)
+
+if(nrow(pval.temp)>0){
+venn.ls[["+Mtb vs media\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & !grepl("Sample_Group",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["RSTR vs LTBI\nexpression"]] <- pval.temp %>% 
+  filter(grepl("Sample_Group", variable) & !grepl("condition",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Interaction\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & grepl("Sample_Group", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+# venn.ls[["Age"]] <- pval.temp %>%
+#   filter(grepl("M0_KCVAGE", variable)) %>%
+#     distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Sex"]] <- pval.temp %>% 
+  filter(grepl("M0_KCVSEX", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Batch"]] <- pval.temp %>% 
+  filter(grepl("experiment", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn(ilab=FALSE, zcolor = "style",ilcs=1, sncs=1,
+     x=venn.ls, box=FALSE)
+  
+  title(sub=paste(samp, kin, sub.set, co.var, "\nFDR <", fdr.cutoff, sep=" "), 
+        line = -1, cex.sub=1.5)
+}
+}}}}
+```
+
+```{r echo=FALSE}
+png(filename="results/model_selection/model_venn_compare.png",
+    width=15, height=5, units = "in", res=150)
+par(mfrow=c(1,3))
+
+for(samp in unique(gene_pval_all$samples)){
+for(kin in unique(gene_pval_all$model)){
+for(sub.set in unique(gene_pval_all$CHR)){
+for(co.var in levels(gene_pval_all$coVar)){
+venn.ls <- list()
+
+pval.temp <- gene_pval_all %>% 
+  filter(model==kin & coVar == co.var & CHR == sub.set & samples == samp &
+           FDR <= fdr.cutoff)
+
+if(nrow(pval.temp)>0){
+venn.ls[["+Mtb vs media\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & !grepl("Sample_Group",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["RSTR vs LTBI\nexpression"]] <- pval.temp %>% 
+  filter(grepl("Sample_Group", variable) & !grepl("condition",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Interaction\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & grepl("Sample_Group", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+# venn.ls[["Age"]] <- pval.temp %>%
+#   filter(grepl("M0_KCVAGE", variable)) %>%
+#     distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Sex"]] <- pval.temp %>% 
+  filter(grepl("M0_KCVSEX", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Batch"]] <- pval.temp %>% 
+  filter(grepl("experiment", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn(ilab=FALSE, zcolor = "style",ilcs=1, sncs=1,
+     x=venn.ls, box=FALSE)
+  
+  title(sub=paste(samp, kin, sub.set, co.var, "FDR <", fdr.cutoff, sep=" "), 
+        line = -1, cex.sub=1.5)
+}
+}}}}
+dev.off()
+```
+
+Only main terms.
+
+```{r echo=FALSE, fig.width=8.5, fig.height=8}
+for(samp in unique(gene_pval_all$samples)){
+for(kin in unique(gene_pval_all$model)){
+par(mfrow=c(2,3))
+for(sub.set in unique(gene_pval_all$CHR)){
+for(co.var in levels(gene_pval_all$coVar)){
+venn.ls <- list()
+
+pval.temp <- gene_pval_all %>% 
+  filter(model==kin & coVar == co.var & CHR == sub.set & samples == samp &
+           FDR <= fdr.cutoff)
+
+if(nrow(pval.temp)>0){
+venn.ls[["+Mtb vs media\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & !grepl("Sample_Group",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["RSTR vs LTBI\nexpression"]] <- pval.temp %>% 
+  filter(grepl("Sample_Group", variable) & !grepl("condition",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Interaction\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & grepl("Sample_Group", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn(ilab=FALSE, zcolor = "style",ilcs=1, sncs=1,
+     x=venn.ls, box=FALSE)
+  
+  title(sub=paste(samp, kin, sub.set, co.var, "\nFDR <", fdr.cutoff, sep=" "), 
+        line = -1, cex.sub=1.5)
+}
+}}}}
+```
+
+```{r echo=FALSE}
+png(filename="results/model_selection/main.terms_venn_compare.png",
+    width=15, height=10, units = "in", res=150)
+par(mfrow=c(2,3))
+
+for(samp in unique(gene_pval_all$samples)){
+for(kin in unique(gene_pval_all$model)){
+for(sub.set in unique(gene_pval_all$CHR)){
+for(co.var in levels(gene_pval_all$coVar)){
+venn.ls <- list()
+
+pval.temp <- gene_pval_all %>% 
+  filter(model==kin & coVar == co.var & CHR == sub.set & samples == samp &
+           FDR <= fdr.cutoff)
+
+if(nrow(pval.temp)>0){
+venn.ls[["+Mtb vs media\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & !grepl("Sample_Group",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["RSTR vs LTBI\nexpression"]] <- pval.temp %>% 
+  filter(grepl("Sample_Group", variable) & !grepl("condition",variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["Interaction\nexpression"]] <- pval.temp %>% 
+  filter(grepl("condition", variable) & grepl("Sample_Group", variable)) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn(ilab=FALSE, zcolor = "style",ilcs=1, sncs=1,
+     x=venn.ls, box=FALSE)
+  
+  title(sub=paste(samp, kin, sub.set, co.var, "FDR <", fdr.cutoff, sep=" "), 
+        line = -1, cex.sub=1.5)
+}
+}}}}
+dev.off()
+```
+
+DEGs (significant for interaction or RSTR)
+
+```{r echo=FALSE}
+temp <- gene_pval_all %>% 
+  filter(grepl("Sample_Group", variable) & FDR <= fdr.cutoff) %>% 
+  distinct(gene, samples, model,  CHR, coVar) %>% 
+  count(samples, model,  CHR, coVar) %>% 
+  rename(Total=n)
+
+gene_pval_all %>% 
+  filter(grepl("Sample_Group", variable) & FDR <= fdr.cutoff) %>% 
+  mutate(variable = recode_factor(factor(variable),
+                           "conditionTB:Sample_GroupRSTR"="Mtb:RSTR interaction",
+                           "condition:Sample_Group"="Mtb:RSTR interaction",
+                           "Sample_Group"="RSTR",
+                           "Sample_GroupRSTR"="RSTR")) %>% 
+  count(samples, model,  CHR, coVar, variable) %>% 
+  pivot_wider(names_from = variable, values_from = n) %>% 
+  mutate(RSTR = ifelse(is.na(RSTR), 0, RSTR)) %>% 
+  full_join(temp) %>% 
+
+kable(align="c") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  collapse_rows(1:3, valign="top") %>% 
+  add_header_above(c(" "=4, "DEG FDR < 0.2"=3))
+```
+
+# R session
+
+```{r}
+sessionInfo()
+```
+
+***

@@ -1,0 +1,896 @@
+---
+title: "RNA-seq data cleaning"
+subtitle: "Uganda: TB-induced RSTR vs LTBI"
+author: "Kim Dill-McFarland, kadm@uw.edu"
+date: "version `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+  pdf_document:
+    toc: yes
+editor_options:
+  chunk_output_type: console
+header-includes:
+ \usepackage{float}
+---
+# Background
+
+The purpose of this workflow is to complete basic data cleaning of metadata and RNA-seq libraries. This includes 1) removing low coverage libraries, 2) filtering rare genes, 3) removing outlying libraries and duplicates, and 4) normalizing for RNA composition. 
+
+# Setup
+Load packages
+
+```{r setup, message=FALSE, warning=FALSE}
+# Empirical analysis of digital gene expression data
+## Data normalization
+library(edgeR)
+
+# Data manipulation and figures
+library(tidyverse)
+  # Modify ggplot figures to non-overlapping text labels
+  library(ggrepel)
+  # Modify ggplot data order within facets
+  library(drlib)
+  # Plot log scales
+  library(scales)
+  #Multi-panel figures
+  library(cowplot)
+
+# Batch correction
+library(scBatch) #https://github.com/tengfei-emory/scBatch
+library(sva) #https://github.com/zhangyuqing/ComBat-seq
+
+# Print pretty table to knit file
+library(knitr)
+library(kableExtra)
+  options(knitr.kable.NA = '')
+  opts_chunk$set(fig.pos = 'H')
+
+#Create 'not in' operator
+`%notin%` <- Negate(`%in%`)
+```
+
+Set seed
+
+```{r}
+set.seed(4389)
+```
+
+# Read in and format data 
+## Metadata
+
+```{r message=FALSE}
+meta <- read_csv("data_raw/2020.11.20RSTR_Hawn_metadata.csv")
+```
+
+## Counts
+
+```{r message=FALSE, warning=FALSE}
+#Orig data set
+count1 <- read_csv("data_raw/Hawn_UgandaMacrophage_counts.csv") %>% 
+  rename(symbol = X1) 
+#Validation data set
+count2 <- read_csv("data_raw/Hawn_UgandaValidation_counts.csv") %>% 
+  rename(symbol = X1) %>% 
+  #rename to match count1
+  rename_all(~gsub("-", "_", .)) %>% 
+  rename_all(~gsub("Media", "MEDIA", .))
+```
+
+Remove samples from the original data set that failed (*e.g.* HIV+ or contamination)
+
+```{r echo=FALSE}
+count1.fail <- meta %>% 
+  select(RS_SUB_ACCESSION_NO, mono.RNAseq) %>% 
+  filter(mono.RNAseq == "FAIL") %>% 
+  mutate(libM = paste(RS_SUB_ACCESSION_NO, "MEDIA", sep="_"),
+         libT = paste(RS_SUB_ACCESSION_NO, "TB", sep="_")) %>% 
+  pivot_longer(libM:libT, values_to="libID")
+
+count1.filter <- count1 %>% 
+  select(-all_of(count1.fail$libID))
+```
+
+# Data cleaning: combined 
+
+Combine original and validation data sets. Create metadata variable for original vs validation data sets.
+
+```{r}
+count.all <- full_join(count1.filter, count2, by="symbol")
+```
+
+```{r}
+meta.all <- data.frame(libID = colnames(count.all)[-1]) %>% 
+  separate(libID, into=c("RSID", "condition"), 
+           sep="_", remove = FALSE) %>% 
+  mutate(condition = gsub(".[x|y]", "", condition)) %>% 
+  left_join(meta, by=c("RSID"="RS_SUB_ACCESSION_NO")) %>% 
+  arrange(libID) %>% 
+  #orig vs validation
+  mutate(experiment = ifelse(grepl(".x", libID), "original",
+                             ifelse(grepl(".y", libID), "validation",
+           ifelse(libID %in% c("RS102076_MEDIA","RS102076_TB",
+                                          "RS102111_TB"), "original",
+                             ifelse(libID %in% c("RS102111_MEDIA"),
+                                    "validation",
+                                    ifelse(libID %in% colnames(count1.filter),
+                                           "original",
+                                           ifelse(libID %in% colnames(count2), 
+                                                  "validation", NA))))))) 
+```
+
+```{r}
+#Reorder count columns
+count.all <- count.all %>% 
+  dplyr::select(symbol, meta.all$libID)
+
+#Check
+identical(colnames(count.all)[-1], meta.all$libID)
+```
+
+## Filter protein coding genes
+
+Load key and format for all possible symbols.
+
+```{r key, message=FALSE, warning=FALSE, echo=FALSE}
+key <- read_tsv("data_raw/2020.06.18_HGNC.gene.key.txt",
+                na=c("")) %>% 
+  rename_all(~gsub(" ", "_", .)) %>% 
+  # rename variable to match count data
+  dplyr::rename(geneName = Ensembl_gene_ID) %>% 
+  # convert to long format for all possible symbols
+  separate(Previous_symbols, into=as.character(c(1:18)), sep=", ") %>% 
+  separate(Alias_symbols, into=as.character(c(19:37)), sep=", ") %>% 
+  pivot_longer(c(Approved_symbol, as.character(1:37)),
+               values_to="symbol") %>% 
+  drop_na(symbol) %>% 
+  mutate(symbol_type = ifelse(name %in% as.character(c(1:18)),
+                              "Previous_symbol",
+                              ifelse(name %in% as.character(c(19:37)),
+                              "Alias_symbol",
+                              name))) %>% 
+  select(symbol, geneName, symbol_type, Locus_group)
+```
+
+Filter gene key to protein coding (pc) genes that occur in the count data set.
+
+```{r message=FALSE, echo=FALSE}
+key.pc <- key %>% 
+  filter(Locus_group == "protein-coding gene") %>% 
+  # Keep only genes found in dataset 
+  filter(symbol %in% count.all$symbol) %>% 
+  distinct() %>% 
+  arrange(symbol) %>% 
+  #collapse multiple anno per symbol
+  group_by(symbol) %>% 
+  summarise(geneName = paste(unique(geneName), collapse="/"),
+         symbol_type = paste(unique(symbol_type), collapse="/"),
+         Locus_group = paste(unique(Locus_group), collapse="/"))
+```
+
+Filter the count data to pc genes as well.
+
+```{r message=FALSE, echo=FALSE}
+count.all.pc <- count.all %>% 
+  filter(symbol %in% key.pc$symbol) %>% 
+  arrange(symbol)
+```
+
+#### Check genes
+
+All genes in count and key in the same order?
+
+```{r echo=FALSE}
+identical(count.all.pc$symbol, key.pc$symbol)
+```
+
+## Assess library coverage
+#### Total aligned counts
+
+Assess aligned counts per library. Higher counts indicate high coverage and are preferred. 
+
+Plot total counts per library. Libraries outside cutoffs are labeled as "questionable". The minimum total sequences cutoff set above is indicated by a horizontal line.
+
+```{r tot.seqs, echo=FALSE, fig.width=8.5, message=FALSE}
+count.all.pc %>% 
+  pivot_longer(-symbol) %>% 
+  group_by(name) %>% 
+  summarise(tot = sum(value, na.rm=TRUE)) %>% 
+  separate(name, into=c("RSID","condition"), sep="_", remove=FALSE) %>% 
+  mutate(RSID = ifelse(grepl(".x", condition), paste(RSID, "x", sep="."),
+                       ifelse(grepl(".y", condition), paste(RSID, "y", sep="."),
+                              RSID)),
+    condition = gsub(".[x|y]","",condition)) %>% 
+
+  ggplot(aes(x=reorder_within(RSID, by=tot, within=condition), 
+           y=tot, fill=condition))  +
+    geom_col() +
+    # Facet by variable of interest
+    facet_grid(~condition, scales="free_x", space="free") +
+    # Add cutoff line
+    geom_hline(yintercept = 500000) +
+    geom_hline(yintercept = 1000000, linetype = "dashed") +
+    facet_wrap(~condition, scales="free_x") +
+    # Beautify
+    theme_classic() +
+    theme(axis.text.x = element_text(size=rel(0.75),
+                                     angle = 90, hjust = 1),
+        legend.position = "none") +
+    labs(x="RSID", y="Total aligned counts\n(Log scale)", fill="") +
+    scale_x_reordered() +
+    scale_y_continuous(trans = 'log10',
+    breaks = trans_breaks("log10", function(x) 10^x),
+    labels = trans_format("log10", math_format(10^.x)))
+```
+
+## Filter by library coverage
+
+All libraries have sufficient sequences for analysis.
+
+## Correct batch effects
+
+There is an apparent batch effect between the original and validation data sets. This is likely caused by true batch differences including about 1 year between processing and sequencing on a HiSeq vs NovaSeq.
+
+```{r echo=FALSE}
+#Convert count df to matrix
+count.all.pc.mat <- count.all.pc %>% 
+  column_to_rownames("symbol") %>% 
+  as.matrix()
+```
+
+First, we explore quantile normalization with `scBatch`.
+
+```{r scBatch, eval=FALSE}
+#Calculate distances  
+scbatch.dist <- QuantNorm(count.all.pc.mat, 
+            logdat = FALSE, standardize = FALSE,
+            batch = as.numeric(as.factor(meta.all$experiment)),
+            method = "row/column", cor_method = "pearson",
+            tol = 1E-4, max = 50)
+
+#correct counts
+## Param from bulk RNA-seq example
+## https://github.com/tengfei-emory/scBatch-paper-scripts/blob/master/Fig3_ENCODE_script.r
+count.all.pc.scbatch <- scBatchCpp(c = count.all.pc.mat,
+             w = diag(ncol(count.all.pc)-1),
+             d = scbatch.dist,
+             m = 2, max = 50, step = 1E-6, tol = 1E-20,
+             derif = scBatch::derif, 
+             verbose = TRUE)
+```
+
+```{r echo=FALSE, eval=FALSE}
+#Reinstate names
+rownames(count.all.pc.scbatch) <- rownames(count.all.pc.mat)
+colnames(count.all.pc.scbatch) <- colnames(count.all.pc.mat)
+
+#Remove negative values
+count.all.pc.scbatch.no0 <- count.all.pc.scbatch %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  mutate(across(-rowname, ~ifelse(. < 0, 0, .))) %>% 
+  column_to_rownames()
+```
+
+```{r eval=FALSE, echo=FALSE}
+save(count.all.pc.scbatch.no0, 
+     file="data_raw/scBatch.counts.RData")
+```
+
+Next, we explore negative binomial normalization with `ComBat-Seq` including Mtb condition, RSTR status, sex, and age as co-variates.
+
+```{r combat, eval=FALSE}
+count.all.pc.combat <- ComBat_seq(count.all.pc.mat,
+                 batch = meta.all$experiment,
+                 group = meta.all$condition,
+                 covar_mod = meta.all[,c("Sample_Group","M0_KCVSEX",
+                                           "KCHCA_AGE_YR_CURRENT")])
+
+save(count.all.pc.combat, file="data_raw/combatSeq.counts.RData")
+```
+
+Comparing these methods, we see that `Combat-Seq` better corrects for batch effects. It also runs signficantly faster than `scBatch` and allows additional co-variate modeling. Thus, `Combat-Seq` will be used.
+
+```{r PCA.all, echo=FALSE, warning=FALSE, message=FALSE}
+#Calculate PCA for all data.
+PCA.all <- count.all.pc.mat %>% 
+  #Convert to log counts per million
+  cpm(., log=TRUE) %>% 
+  t() %>% 
+  #Calc PCA
+  prcomp()
+
+PC1.label <- paste("PC1 (", summary(PCA.all)$importance[2,1]*100, "%)", sep="")
+PC2.label <-paste("PC2 (", summary(PCA.all)$importance[2,2]*100, "%)", sep="")
+
+# Extract PC values
+PCA.all.dat <- as.data.frame(PCA.all$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs for plotting
+  dplyr::select(libID, PC1:PC3) %>% 
+  # Merge with metadata
+  left_join(meta.all, by="libID")
+```
+
+```{r echo=FALSE, warning=FALSE}
+plot.all <- PCA.all.dat %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(shape=condition, color=experiment),size=3) + 
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="Raw\nUn-normalized logCPM") +
+  coord_fixed(ratio=1)
+```
+
+```{r PCA.scbatch, echo=FALSE, warning=FALSE, message=FALSE}
+#Load scBatch result since too long to run in Rmd
+load("data_raw/scBatch.counts.RData")
+
+#Calculate PCA for all data.
+PCA.scbatch <- count.all.pc.scbatch.no0 %>% 
+  #Convert to log counts per million
+  cpm(., log=TRUE) %>% 
+  t() %>% 
+  #Calc PCA
+  prcomp()
+
+PC1.label <- paste("PC1 (", summary(PCA.scbatch)$importance[2,1]*100, "%)", sep="")
+PC2.label <-paste("PC2 (", summary(PCA.scbatch)$importance[2,2]*100, "%)", sep="")
+
+# Extract PC values
+PCA.scbatch.dat <- as.data.frame(PCA.scbatch$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs for plotting
+  dplyr::select(libID, PC1:PC3) %>% 
+  # Merge with metadata
+  left_join(meta.all, by="libID")
+```
+
+```{r echo=FALSE, warning=FALSE}
+plot.scbatch <- PCA.scbatch.dat %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(shape=condition, color=experiment),size=3) + 
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="scBatch corrected\nUn-normalized logCPM") +
+  coord_fixed(ratio=1)
+```
+
+```{r PCA.combat, echo=FALSE, warning=FALSE}
+load("data_raw/combatSeq.counts.RData")
+
+#Calculate PCA for all data.
+PCA.combat <- count.all.pc.combat %>% 
+  #Convert to log counts per million
+  cpm(., log=TRUE) %>% 
+  t() %>% 
+  #Calc PCA
+  prcomp()
+
+PC1.label <- paste("PC1 (", summary(PCA.combat)$importance[2,1]*100, "%)", sep="")
+PC2.label <-paste("PC2 (", summary(PCA.combat)$importance[2,2]*100, "%)", sep="")
+
+# Extract PC values
+PCA.combat.dat <- as.data.frame(PCA.combat$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs for plotting
+  dplyr::select(libID, PC1:PC3) %>% 
+  # Merge with metadata
+  left_join(meta.all, by="libID")
+```
+
+```{r echo=FALSE, warning=FALSE}
+plot.combat <- PCA.combat.dat %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(shape=condition, color=experiment),size=3) + 
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="ComBat-Seq corrected\nUn-normalized logCPM") +
+  coord_fixed(ratio=1)
+```
+
+```{r echo=FALSE, fig.width=8.5}
+plot_grid(plot.all, plot.scbatch, plot.combat, align="h", nrow=1)
+```
+
+## PCA outliers
+
+Visualize PCA outliers defined as any library with PC1 and/or PC2 values greater than 3 standard deviations away from the PC mean of their respective condition group.
+
+```{r PCA.outlier, echo=FALSE, message=FALSE}
+PCA.all.sd <- PCA.combat.dat %>% 
+  group_by(condition) %>% 
+  #Calculate PC mean std deviation
+  summarise(.groups="keep",
+    PC1.mean = mean(PC1),
+    PC1.sd = sd(PC1),
+    PC2.mean = mean(PC2),
+    PC2.sd = sd(PC2)) %>% 
+  #Calculate +/- 3 sd limits
+  mutate(
+    PC1.min = PC1.mean-(3*PC1.sd),
+    PC1.max = PC1.mean+(3*PC1.sd),
+    PC2.min = PC2.mean-(3*PC2.sd),
+    PC2.max = PC2.mean+(3*PC2.sd))
+  
+PCA.combat.dat <- PCA.combat.dat %>%   
+  full_join(PCA.all.sd) %>% 
+  #ID potential outliers
+  mutate(col.group = ifelse(PC1 > PC1.max | PC1 < PC1.min |
+                            PC2 > PC2.max | PC2 < PC2.min, 
+                            "potential outlier", "okay"))
+
+plot2 <- PCA.combat.dat %>%       
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(color=col.group),size=3) + 
+  geom_text_repel(data=filter(PCA.combat.dat,
+                            col.group == "potential outlier"),
+            aes(label=libID), show.legend = FALSE) +
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="ComBat-Seq corrected logCPM") +
+  coord_fixed(ratio=1) +
+  scale_color_manual(values = c("#969696","#b10026"))
+```
+
+```{r echo=FALSE, fig.width=8.5}
+plot_grid(plot.combat,plot2)
+```
+
+## Filter PCA outliers
+
+While some libraries were flagged as potential outliers, they cluster with their respective groups overall. Thus, these samples will not be removed and will be re-assessed after rare gene filtering.
+
+## Duplicate samples
+#### Assess duplicates
+
+```{r PCA.dups1, echo=FALSE, warning=FALSE}
+#pre-batch correction
+#Calculate PCA for all data.
+PCA.dups <- as.data.frame(count.all.pc) %>% 
+  rownames_to_column() %>% 
+  dplyr::select(rowname, contains(".")) %>% 
+  column_to_rownames() %>% 
+  #Convert to log counts per million
+  cpm(., log=TRUE) %>% 
+  t() %>% 
+  #Calc PCA
+  prcomp()
+
+PC1.label <- paste("PC1 (", summary(PCA.dups)$importance[2,1]*100, "%)", sep="")
+PC2.label <-paste("PC2 (", summary(PCA.dups)$importance[2,2]*100, "%)", sep="")
+
+# Extract PC values
+PCA.dups.dat <- as.data.frame(PCA.dups$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs for plotting
+  dplyr::select(libID, PC1:PC3) %>% 
+  # Add metadata
+  separate(libID, into=c("RSID","condition","experiment"), sep="_|[.]",
+           remove = FALSE) %>% 
+  mutate(experiment = ifelse(experiment == "x", "original", "validation"))
+
+plot.dup1 <- PCA.dups.dat %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(shape=paste(RSID, condition, sep="_"),
+                 color=experiment),size=3) + 
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="Raw\nUn-normalized logCPM") +
+  coord_fixed(ratio=1)
+```
+
+```{r PCA.dups2, echo=FALSE, warning=FALSE}
+#Calculate PCA for all data.
+PCA.dups <- as.data.frame(count.all.pc.combat) %>% 
+  rownames_to_column() %>% 
+  dplyr::select(rowname, contains(".")) %>% 
+  column_to_rownames() %>% 
+  #Convert to log counts per million
+  cpm(., log=TRUE) %>% 
+  t() %>% 
+  #Calc PCA
+  prcomp()
+
+PC1.label <- paste("PC1 (", summary(PCA.dups)$importance[2,1]*100, "%)", sep="")
+PC2.label <-paste("PC2 (", summary(PCA.dups)$importance[2,2]*100, "%)", sep="")
+
+# Extract PC values
+PCA.dups.dat <- as.data.frame(PCA.dups$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs for plotting
+  dplyr::select(libID, PC1:PC3) %>% 
+  # Add metadata
+  separate(libID, into=c("RSID","condition","experiment"), sep="_|[.]",
+           remove = FALSE) %>% 
+  mutate(experiment = ifelse(experiment == "x", "original", "validation"))
+
+plot.dup2 <- PCA.dups.dat %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(shape=paste(RSID, condition, sep="_"),
+                 color=experiment),size=3) + 
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="ComBat-Seq corrected\nUn-normalized logCPM") +
+  coord_fixed(ratio=1)
+```
+
+```{r echo=FALSE, warning=FALSE}
+plot_grid(plot.dup1, plot.dup2)
+```
+
+Total sequences per sample.
+
+```{r echo=FALSE, message=FALSE}
+as.data.frame(count.all.pc.combat) %>% 
+  rownames_to_column("symbol") %>% 
+  pivot_longer(-symbol, names_to="libID") %>% 
+  group_by(libID) %>% 
+  summarise(tot.seqs = sum(value, na.rm=TRUE)) %>% 
+  ungroup() %>% 
+  left_join(meta.all) %>% 
+  group_by(experiment) %>% 
+  summarise(mean.seqs = mean(tot.seqs),
+            min.seqs = min(tot.seqs),
+            max.seqs = max(tot.seqs)) %>% 
+  mutate(across(mean.seqs:max.seqs, 
+                ~formatC(., digits=3, format="E"))) %>% 
+  
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+## Filter duplicates
+
+Keep duplicates with the most sequences.
+
+```{r message=FALSE, echo=FALSE}
+dups.to.remove <- as.data.frame(count.all.pc.combat) %>% 
+  rownames_to_column("symbol") %>% 
+  #Get duplicates
+  select(symbol, ends_with(".x"), ends_with(".y")) %>% 
+  #Calculate colSums
+  pivot_longer(-symbol) %>% 
+  group_by(name) %>% 
+  summarise(tot = sum(value, na.rm=TRUE)) %>% 
+  ungroup() %>% 
+  #list least sequences duplicate
+  separate(name, into=c("libID", "rep"), sep="[.]", remove = FALSE) %>% 
+  arrange(tot) %>% 
+  group_by(libID) %>% 
+  slice_head()
+
+#Remove from counts
+count.all.pc.combat.dedup <- as.data.frame(count.all.pc.combat) %>% 
+  rownames_to_column()  %>% 
+  select(-all_of(dups.to.remove$name)) %>% 
+  #Remove join naming
+  rename_all(~gsub("[.][x|y]$", "", .)) %>% 
+  column_to_rownames()
+```
+
+Keep data for samples with remaining RNA-seq data. 
+
+```{r echo=FALSE}
+meta.dedup <- meta.all %>% 
+  filter(libID %notin% dups.to.remove$name) %>% 
+  mutate(libID = gsub("[.][x|y]$", "", libID))
+```
+
+### Summarize samples
+
+All samples in count and metadata in the same order?
+  
+```{r echo=FALSE}
+identical(colnames(count.all.pc.combat.dedup), meta.dedup$libID)
+```
+
+```{r echo=FALSE}
+meta.dedup %>% 
+  group_by(Sample_Group, condition) %>%
+  tally() %>% 
+  
+  kable(align="l",caption="Total libraries") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+## Filter rare genes
+
+Create DGEList object.
+
+```{r dgelist, echo=FALSE}
+dat <- DGEList(
+  #count table. move gene names to column names
+  counts=as.matrix(count.all.pc.combat.dedup),
+  #metadata
+  samples=meta.dedup,
+  #keep genes in count table
+  genes=key.pc)
+```
+
+```{r voom1, echo=FALSE, warning=FALSE}
+temp <- voom(dat, 
+        design=model.matrix(~ condition, data=dat$samples),
+        plot=FALSE, save.plot = TRUE)
+
+MV.plot1 <- data.frame(
+  x = temp$voom.xy$x, 
+  y = temp$voom.xy$y,
+  linex = temp$voom.line$x, 
+  liney = temp$voom.line$y) %>% 
+  
+  ggplot() +
+  geom_point(aes(x=x, y=y), size=0.5) +
+  geom_path(aes(x=linex, y=liney), color="red") +
+  theme_classic() +
+  labs(x="log2( count size + 0.5 )", y="Sqrt (stdev)",
+       title="All voom\nMean-variance trend")
+```
+
+The raw gene sets contain highly variable, low abundance/rare genes (left side of plots). These genes will be filtered at 1 CPM in at least 5% of samples (N = `r round(0.05*ncol(dat))`). 
+
+```{r}
+source("https://raw.githubusercontent.com/kdillmcfarland/R_bioinformatic_scripts/master/RNAseq_rare_gene_filter.R")
+
+rare.gene.filter(dat = dat, names = "symbol",
+                 min.pct = 5, 
+                 min.CPM = 1,
+                 name = 'dat.abund')
+```
+
+```{r voom2, echo=FALSE, warning=FALSE}
+temp2 <- voom(dat.abund, 
+                               design=model.matrix(~ condition,
+                                      data=dat.abund$samples),
+                               plot=FALSE, save.plot = TRUE)
+
+MV.plot2 <- data.frame(
+  x = temp2$voom.xy$x, 
+  y = temp2$voom.xy$y,
+  linex = temp2$voom.line$x, 
+  liney = temp2$voom.line$y) %>% 
+  
+  ggplot() +
+  geom_point(aes(x=x, y=y), size=0.5) +
+  geom_path(aes(x=linex, y=liney), color="red") +
+  theme_classic() +
+  labs(x="log2( count size + 0.5 )", y="Sqrt (stdev)",
+       title="Abundant voom\nMean-variance trend")
+
+plot_grid(MV.plot1, MV.plot2)
+```
+
+```{r echo=FALSE}
+#Count genes removed
+genes <- nrow(dat$genes)
+genes.abund <- nrow(dat.abund$genes)
+```
+
+This removes `r genes-genes.abund` (~ `r round((genes-genes.abund)/genes*100, digits=0)`%) genes. 
+
+```{r echo=FALSE, message=FALSE}
+#Save filtered genes
+data.frame(geneName = count.all$symbol) %>% 
+  mutate(protein.coding = ifelse(geneName %in% count.all.pc$symbol,
+                                 "Y", "N"),
+         abundant = ifelse(geneName %in% rownames(dat.abund$counts),
+                           "Y","N")) %>% 
+  write_csv("results/gene_level/combined.filtered.genes.csv")
+```
+
+## Normalize for RNA composition
+
+Calculate factors to scale library sizes.
+
+```{r norm}
+dat.abund.norm <- calcNormFactors(dat.abund)
+```
+
+## Normalize with voom
+
+```{r voom3}
+dat.abund.norm.voom <- voomWithQualityWeights(
+                           dat.abund.norm,
+                           design=model.matrix(~ condition,
+                                 data=dat.abund.norm$samples),
+                           plot=TRUE)
+```
+
+## PCA clean data
+
+```{r PCA.final, echo=FALSE, warning=FALSE, message=FALSE}
+#Calculate PCA for voom norm data.
+PCA.voom <- as.data.frame(dat.abund.norm.voom$E) %>% 
+  t() %>% 
+  #Calc PCA
+  prcomp()
+
+PC1.label <- paste("PC1 (", summary(PCA.voom)$importance[2,1]*100, "%)", sep="")
+PC2.label <-paste("PC2 (", summary(PCA.voom)$importance[2,2]*100, "%)", sep="")
+
+# Extract PC values
+PCA.voom.dat <- as.data.frame(PCA.voom$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs for plotting
+  dplyr::select(libID, PC1:PC3) %>% 
+  # Merge with metadata
+  left_join(as.data.frame(dat.abund.norm.voom$targets),
+            by="libID")
+```
+
+```{r echo=FALSE, warning=FALSE}
+plot3 <- PCA.voom.dat %>% 
+  ggplot(aes(PC1, PC2, color=experiment, shape=condition)) +
+  geom_point(size=3) + 
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="voom normalized logCPM") +
+  coord_fixed(ratio=1) +
+  stat_ellipse()
+```
+
+```{r echo=FALSE, message=FALSE}
+PCA.voom.sd <- PCA.voom.dat %>% 
+  group_by(experiment, condition) %>% 
+  #Calculate PC mean std deviation
+  summarise(.groups="keep",
+    PC1.mean = mean(PC1),
+    PC1.sd = sd(PC1),
+    PC2.mean = mean(PC2),
+    PC2.sd = sd(PC2)) %>% 
+  #Calculate +/- 3 sd limits
+  mutate(
+    PC1.min = PC1.mean-(3*PC1.sd),
+    PC1.max = PC1.mean+(3*PC1.sd),
+    PC2.min = PC2.mean-(3*PC2.sd),
+    PC2.max = PC2.mean+(3*PC2.sd))
+  
+PCA.voom.dat <- PCA.voom.dat %>%   
+  full_join(PCA.voom.sd) %>% 
+  #ID potential outliers
+  mutate(col.group = ifelse(PC1 > PC1.max | PC1 < PC1.min |
+                            PC2 > PC2.max | PC2 < PC2.min, 
+                            "potential outlier", "okay"))
+
+plot4 <- PCA.voom.dat %>%       
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(color=col.group),size=3) + 
+  geom_text_repel(data=filter(PCA.voom.dat,
+                            col.group == "potential outlier"),
+            aes(label=libID), show.legend = FALSE) +
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="voom normalized logCPM") +
+  coord_fixed(ratio=1) +
+  scale_color_manual(values = c("#969696","#b10026"))
+```
+
+```{r echo=FALSE, fig.width=8.5}
+plot_grid(plot3,plot4)
+```
+
+## Save combined data
+
+Write as RData
+
+```{r}
+#Rename to short form
+dat.combined <- dat.abund.norm
+dat.combined.voom <- dat.abund.norm.voom
+meta.combined <- meta.dedup
+
+save(dat.combined, dat.combined.voom, meta.combined, 
+     file="data_clean/RSTR_RNAseq_data_combined_clean.RData")
+```
+
+## Remove FULLIDNO duplicates
+
+Duplicate samples were removed by matching RSIDs. However, some individuals (FULLIDNO) have multiple samples in the data set. For these, the higher quality sample will be retained. 
+
+```{r echo=FALSE}
+dups2 <- dat.abund.norm.voom$targets %>% 
+  dplyr::count(FULLIDNO, condition) %>% 
+  filter(n>1)
+
+PCA.voom.dat2 <- PCA.voom.dat %>% 
+  mutate(col.group = ifelse(FULLIDNO %in% dups2$FULLIDNO, FULLIDNO,
+                            NA)) %>% 
+  mutate(line.group = paste(FULLIDNO,condition), NA) 
+
+PCA.voom.dat2 %>% 
+  ggplot(aes(PC1, PC2, color=col.group, shape=condition)) +
+  geom_point(size=3) + 
+  geom_line(data=filter(PCA.voom.dat2, !is.na(col.group)),
+                        aes(group = line.group)) +
+  #Beautify
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x=PC1.label, y=PC2.label, 
+       title="voom normalized logCPM") +
+  coord_fixed(ratio=1)
+```
+
+```{r}
+# list RSID with the most media sequences per FULLIDNO donor
+to.keep <- dat.abund.norm$samples %>% 
+  #media samples
+  filter(condition == "MEDIA") %>% 
+  #Keep library with most sequences
+  group_by(FULLIDNO) %>% 
+  slice_max(lib.size) %>% 
+  ungroup() %>% 
+  select(RSID) %>% unlist(use.names = FALSE)
+
+###
+dat.abund.norm.dedup <- dat.abund.norm
+
+dat.abund.norm.dedup$samples <- dat.abund.norm.dedup$samples %>% 
+  filter(RSID %in% to.keep)
+
+dat.abund.norm.dedup$counts <- dat.abund.norm.dedup$counts %>% 
+  rownames_to_column() %>% 
+  select(rowname, all_of(dat.abund.norm.dedup$samples$libID)) %>% 
+  column_to_rownames()
+
+####
+dat.abund.norm.voom.dedup <- dat.abund.norm.voom
+
+dat.abund.norm.voom.dedup$targets <- dat.abund.norm.voom.dedup$targets %>% 
+  filter(RSID %in% to.keep)
+
+dat.abund.norm.voom.dedup$E <- as.data.frame(dat.abund.norm.voom.dedup$E) %>% 
+  rownames_to_column() %>% 
+  select(rowname, all_of(dat.abund.norm.voom.dedup$targets$libID)) %>% 
+  column_to_rownames()
+
+####
+meta.dedup2 <- meta.dedup %>% 
+  filter(RSID %in% to.keep)
+```
+
+This removed `r nrow(dat.abund.norm.voom$targets)-nrow(dat.abund.norm.voom.dedup$targets)` samples.
+
+```{r}
+#Rename to short form
+dat.combined <- dat.abund.norm.dedup
+dat.combined.voom <- dat.abund.norm.voom.dedup
+meta.combined <- meta.dedup2
+
+save(dat.combined, dat.combined.voom, meta.combined, 
+     file="data_clean/RSTR_RNAseq_data_combined_uniqueFULLID.RData")
+```
+
+# R session
+
+```{r}
+sessionInfo()
+```
+
+***

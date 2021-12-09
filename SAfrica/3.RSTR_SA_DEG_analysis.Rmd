@@ -1,0 +1,700 @@
+---
+title: "RNA-seq differential gene expression"
+subtitle: "TB-induced RSTR vs LTBI (South Africa)"
+author: "Kim Dill-McFarland, kadm@uw.edu"
+date: "version `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+editor_options:
+  chunk_output_type: console
+---
+# Background
+
+The purpose of this workflow is to identify TB-induced differentially expressed genes (DEG).
+
+# Setup
+Load packages
+
+```{r message=FALSE, warning=FALSE}
+library(venn)
+# Genomic annotation
+library(org.Hs.eg.db)
+library(biomaRt)
+library(topGO)
+# Print tty table to knit file
+library(knitr)
+library(kableExtra)
+# Data manipulation and figures
+library(tidyverse)
+    # Multi-panel figures for ggplot
+    library(cowplot)
+`%notin%` <- Negate(`%in%`)
+```
+
+Set seed
+
+```{r}
+set.seed(4389)
+```
+
+# Customization
+
+Set variable names and cutoffs for this workflow.
+
+```{r}
+#Rdata file WITHIN project directory that holds cleaned data
+data.file <- "data_clean/RSTR_SA_dat_clean.RData"
+
+#Prefix to give file names
+basename <- "SA_RSTR.Mtb"
+#Define variable(s) of interest
+#Used in PCA plots and to select significant genes to be used in module building
+vars_of_interest <- c("condition", "Sample_Group")
+```
+
+# Load data
+
+```{r message=FALSE, warning=FALSE}
+#Load data
+attach(data.file)
+```
+
+Sample summary.
+
+```{r echo=FALSE}
+dat.abund.norm.voom$targets %>%
+  count(condition, Sample_Group) %>% 
+  
+  kable(align="c") %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r}
+#Rename for workflow
+dat.voom <- dat.abund.norm.voom
+```
+
+# Data exploration
+## PCA (genes)
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=4}
+# Calculate PCA
+PCA <- as.data.frame(dat.voom$E) %>% 
+  t() %>% 
+  prcomp()
+
+PC1.label <- paste("PC1 (", summary(PCA)$importance[2,1]*100, "%)", sep="")
+PC2.label <-paste("PC2 (", summary(PCA)$importance[2,2]*100, "%)", sep="")
+
+# Extract PC values
+PCA.dat <- as.data.frame(PCA$x) %>% 
+  rownames_to_column("libID") %>%
+  # Select PCs
+  dplyr::select(libID, PC1:PC3) %>% 
+  # Merge with metadata
+  left_join(dat.voom$targets, by="libID")
+
+PCA.list <- list()
+#Loop through variables of interest
+for(i in 1:length(vars_of_interest)){
+  PCA <- ggplot(PCA.dat, aes(PC1, PC2)) +
+      geom_point(aes_string(color=vars_of_interest[i]),
+                      size=3) +
+      #Beautify
+      theme_classic() +
+      labs(x=PC1.label, y=PC2.label, 
+           title="voom normalized abundant logCPM",
+           color=vars_of_interest[i]) +
+      coord_fixed(ratio=1) +
+      guides(color=guide_legend(title.position="top", 
+                                title.hjust = 0.5))
+ PCA.list[[i]] <- PCA
+}
+
+PCA.list
+```
+
+# Define significant genes
+## Interaction linear model 
+
+For a comparison of model co-variates (age), see [RSTR RNA-seq model selection](LINK)
+
+```{r message=FALSE}
+#load results
+gene_pval <- read_csv("results/model_selection/SA_RSTR.interaction_age.model.results.csv.gz") 
+```
+
+Annotate genes locations.
+
+```{r}
+#Get reference genome
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl", 
+                   host = "useast.ensembl.org")
+  #Check genome version
+  searchDatasets(mart = ensembl, pattern = "hsapiens")
+
+#Get HGNC symbols and gene positions
+gene.POS <- getBM(attributes = c('hgnc_symbol', 'ensembl_gene_id',
+                                 'entrezgene_id',
+                                 'chromosome_name',
+                                'start_position','end_position',
+                                'strand'),
+      mart = ensembl) %>% 
+  #Rename
+  dplyr::rename(CHR=chromosome_name, gene.strand = strand) %>% 
+  #Calculate max range of positions from multi-annotations
+  filter(!grepl("CHR", CHR)) %>% 
+  group_by(CHR, hgnc_symbol, ensembl_gene_id, entrezgene_id, 
+           gene.strand) %>% 
+  summarise(min.start = min(start_position, na.rm=TRUE),
+            max.end = max(end_position, na.rm=TRUE), .groups = "drop")
+```
+
+```{r warning=FALSE}
+#Add positions based on any name 
+genes.anno <- dat.voom$genes %>% 
+  left_join(gene.POS, by = "ensembl_gene_id") %>%  
+  dplyr::select(geneName, name,
+                ensembl_gene_id, entrezgene_id, CHR, min.start, max.end)
+  
+  
+left_join(gene_pval, genes.anno, by=c("gene"="geneName")) %>% 
+  write_csv(file="results/gene_level/SA_RSTR.Mtb.model.results.anno.csv")
+```
+
+### Significant genes
+
+```{r echo=FALSE}
+fdr.cutoff <- 0.2
+venn.ls <- list()
+venn.ls[["RSTR vs LTBI\nexpression"]] <- gene_pval %>% 
+  filter(variable == "Sample_Group" &
+           FDR <= fdr.cutoff) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+venn.ls[["+Mtb vs media\nexpression"]] <- gene_pval %>% 
+  filter(variable == "condition" &
+           FDR <= fdr.cutoff) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+venn.ls[["Interaction\nexpression"]] <- gene_pval %>% 
+  filter(variable == "condition:Sample_Group" &
+           FDR <= fdr.cutoff) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+venn.ls[["Age\nexpression"]] <- gene_pval %>% 
+  filter(variable == "age" &
+           FDR <= fdr.cutoff) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn(ilab=FALSE, zcolor = "style",ilcs=1.5, sncs=1.5,
+     x=venn.ls, box=FALSE)
+  
+  title(sub=paste("Genes\nFDR < ", fdr.cutoff, sep=""), 
+        line = -1, cex.sub=1.5)
+```
+
+## Contrasts linear model
+
+Interaction term significant genes will be further assessed in pairwise comparisons within Mtb and RSTR groups (*e.g.* contrasts). Since no genes were significant for the main term RSTR, no further modeling is needed for this term.
+
+```{r eval=FALSE}
+source("scripts/kin.model.fxn.R")
+lmekin.loop(dat = dat.voom, kin = NULL, 
+             x.var = c("Sample_Group"), ptID="FULLIDNO",
+             co.var=c("age"),
+             interaction=TRUE, 
+             lm=TRUE, lme=FALSE,
+             subset.var = "condition", subset.lvl = "MEDIA", 
+             subset.genes = c(venn.ls[["Interaction\nexpression"]],
+                             venn.ls[["RSTR vs LTBI\nexpression"]]),
+             outdir="results/gene_level/", name=paste(basename, "media", sep="."),
+             processors=5, p.method="BH")
+
+lmekin.loop(dat = dat.voom, kin = NULL, 
+             x.var = c("Sample_Group"), ptID="FULLIDNO",
+             co.var=c("age"),
+             interaction=TRUE, 
+             lm=TRUE, lme=FALSE,
+             subset.var = "condition", subset.lvl = "TB", 
+             subset.genes = c(venn.ls[["Interaction\nexpression"]],
+                             venn.ls[["RSTR vs LTBI\nexpression"]]),
+             outdir="results/gene_level/", name=paste(basename, "tb", sep="."),
+             processors=5, p.method="BH")
+
+lmekin.loop(dat = dat.voom, kin = NULL, 
+             x.var = c("condition"), ptID="FULLIDNO",
+             co.var=c("age"),
+             interaction=TRUE, 
+             lm=TRUE, lme=FALSE,
+             subset.var = "Sample_Group", subset.lvl = "RSTR", 
+             subset.genes = c(venn.ls[["Interaction\nexpression"]],
+                             venn.ls[["RSTR vs LTBI\nexpression"]]),
+             outdir="results/gene_level/", name=paste(basename, "rstr", sep="."),
+             processors=5, p.method="BH")
+
+lmekin.loop(dat = dat.voom, kin = NULL, 
+             x.var = c("condition"), ptID="FULLIDNO",
+             co.var=c("age"),
+             interaction=TRUE, 
+             lm=TRUE, lme=FALSE,
+             subset.var = "Sample_Group", subset.lvl = "LTBI", 
+             subset.genes = c(venn.ls[["Interaction\nexpression"]],
+                             venn.ls[["RSTR vs LTBI\nexpression"]]),
+             outdir="results/gene_level/", name=paste(basename, "ltbi", sep="."),
+             processors=5, p.method="BH")
+```
+
+### Significant genes
+
+```{r message=FALSE}
+contrast_pval <- read_csv("results/gene_level/SA_RSTR.Mtb.media.model.results.csv.gz") %>% 
+  bind_rows(read_csv("results/gene_level/SA_RSTR.Mtb.tb.model.results.csv.gz")) %>% 
+  bind_rows(read_csv("results/gene_level/SA_RSTR.Mtb.ltbi.model.results.csv.gz")) %>% 
+  bind_rows(read_csv("results/gene_level/SA_RSTR.Mtb.rstr.model.results.csv.gz")) 
+```
+
+```{r echo=FALSE}
+fdr.cutoff <- 0.2
+venn.ls <- list()
+venn.ls[["RSTR vs LTBI\nin media"]] <- contrast_pval %>% 
+  filter(group=="SA_RSTR.Mtb.media" & variable == "Sample_GroupRSTR" &
+           FDR <= fdr.cutoff) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["RSTR vs LTBI\nin +Mtb"]] <- contrast_pval %>% 
+  filter(group=="SA_RSTR.Mtb.tb" & variable == "Sample_GroupRSTR" &
+           FDR <= fdr.cutoff) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["+Mtb vs media\nin LTBI"]] <- contrast_pval %>% 
+  filter(group=="SA_RSTR.Mtb.ltbi" & variable == "conditionTB" &
+           FDR <= fdr.cutoff) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn.ls[["+Mtb vs media\nin RSTR"]] <- contrast_pval %>% 
+  filter(group=="SA_RSTR.Mtb.rstr" & variable == "conditionTB" &
+           FDR <= fdr.cutoff) %>% 
+    distinct(gene) %>% unlist(use.names = FALSE)
+
+venn(ilab=FALSE, zcolor = "style",ilcs=1.5, sncs=1.5,
+     x=venn.ls, box=FALSE)
+  
+  title(sub=paste("Genes\nFDR < ", fdr.cutoff, sep=""), 
+        line = -1, cex.sub=1.5)
+```
+
+## Gene plots
+
+Interaction term DEGs are in `figs/gene_level`
+
+```{r eval=FALSE}
+source("https://raw.githubusercontent.com/kdillmcfarland/R_bioinformatic_scripts/master/RNAseq_boxplot_fxn.R")
+
+pval.toPlot <- contrast_pval %>% 
+  filter(variable %in% c("Sample_GroupRSTR", "conditionTB")) %>% 
+  dplyr::rename(adj.P.Val=FDR, dataset=group) %>% 
+  mutate(group = paste(dataset, variable, sep="."),
+         group = dplyr::recode(group,
+                        "SA_RSTR.Mtb.media.Sample_GroupRSTR"="RSTR.in.MEDIA",
+                        "SA_RSTR.Mtb.tb.Sample_GroupRSTR"="RSTR.in.TB",
+                        "SA_RSTR.Mtb.ltbi.conditionTB"="TB.in.LTBI",
+                        "SA_RSTR.Mtb.rstr.conditionTB"="TB.in.RSTR")) %>% 
+  select(gene, group, adj.P.Val)
+
+plot.all(voom.dat = dat.voom, 
+         pval.dat = pval.toPlot,
+         join.var = "libID", 
+         genes.toPlot = unique(unlist(venn.ls, use.names = FALSE)), 
+         vars = c("condition","Sample_Group","age"), 
+         var.levels=c("RSTR.in.MEDIA","RSTR.in.TB","TB.in.LTBI","TB.in.RSTR"),
+         interaction=TRUE, color.var="Sample_Group",
+         outdir="figs/gene_level/", name="SA_RSTR_TB.DEG_", 
+         cores=2, width=8, height=10)
+```
+
+# Gene set enrichment analysis (GSEA)
+
+```{r message=FALSE, warning=FALSE}
+#Script for running GSEA
+source("https://raw.githubusercontent.com/kdillmcfarland/R_bioinformatic_scripts/master/GSEA_fxn.R")
+```
+
+### Gene set descriptions
+
+* Hallmark gene sets (H)
+    - Hallmark gene sets summarize and represent specific well-defined biological states or processes and display coherent expression. These gene sets were generated by a computational methodology based on identifying overlaps between gene sets in other MSigDB collections and retaining genes that display coordinate expression. 
+* Basic gene sets (C5)
+    - Gene sets that contain genes annotated by the same GO term. Includes:
+    - BP: biological process
+    - CC: cellular component
+    - MF: molecular function
+* Curated gene sets (C2)
+    - Gene sets curated from various sources including online pathway databases, the biomedical literature, and knowledge of domain experts. Includes:
+    - CGP: chemical and genetic perturbations
+    - CP: Canonical pathways
+        * BIOCARTA: BioCarta gene sets
+        * KEGG: KEGG gene sets
+        * PID: PID gene sets
+        * REACTOME: Reactome gene sets
+        
+### Calculate fold change
+
+```{r message=FALSE}
+TB.FC <- as.data.frame(dat.voom$E) %>% 
+  rownames_to_column("hgnc_symbol") %>% 
+  pivot_longer(-hgnc_symbol) %>% 
+  full_join(dat.voom$targets, by=c("name"="libID")) %>% 
+  dplyr::select(FULLIDNO, condition, Sample_Group, hgnc_symbol, value) %>% 
+  pivot_wider(names_from=condition) %>% 
+  mutate(FC = TB-MEDIA) %>% 
+  group_by(hgnc_symbol, Sample_Group) %>% 
+  dplyr::summarise(mean.FC = mean(FC, na.rm=TRUE)) %>% 
+  pivot_wider(names_from = Sample_Group, values_from = mean.FC)
+
+RSTR.FC <- as.data.frame(dat.voom$E) %>% 
+  rownames_to_column("hgnc_symbol") %>% 
+  pivot_longer(-hgnc_symbol) %>% 
+  full_join(dat.voom$targets, by=c("name"="libID")) %>% 
+  dplyr::select(FULLIDNO, condition, Sample_Group, hgnc_symbol, value) %>% 
+  group_by(condition, Sample_Group, hgnc_symbol) %>% 
+  dplyr::summarise(mean.E = mean(value, na.rm=TRUE)) %>% 
+  pivot_wider(names_from=Sample_Group, values_from = mean.E) %>% 
+  mutate(FC = RSTR-LTBI) %>% 
+  group_by(hgnc_symbol, condition) %>% 
+  dplyr::summarise(mean.FC = mean(FC, na.rm=TRUE)) %>% 
+  pivot_wider(names_from = condition, values_from = mean.FC)
+
+FC.all <- full_join(TB.FC, RSTR.FC, by = "hgnc_symbol")
+```
+
+```{r}
+#Format for GSEA function
+FC.ls <- list()
+
+genes.temp <- FC.all$LTBI
+  names(genes.temp) <- FC.all$hgnc_symbol
+FC.ls[["TBinLTBI"]] <- genes.temp
+
+genes.temp <- FC.all$RSTR
+  names(genes.temp) <- FC.all$hgnc_symbol
+FC.ls[["TBinRSTR"]] <- genes.temp
+
+genes.temp <- FC.all$MEDIA
+  names(genes.temp) <- FC.all$hgnc_symbol
+FC.ls[["RSTRinMEDIA"]] <- genes.temp
+
+genes.temp <- FC.all$TB
+  names(genes.temp) <- FC.all$hgnc_symbol
+FC.ls[["RSTRinTB"]] <- genes.temp
+```
+
+### Run GSEA
+#### Hallmark (H)
+
+```{r h, warnings=FALSE, message=FALSE}
+GSEA(gene_list = FC.ls, nperm=10000,
+     outdir="results/GSEA/", plotdir="figs/GSEA/",
+     gmt_file="data_clean/Broad.gene.sets/h.all.v7.2.symbols.gmt", 
+     plot = TRUE, plot.fdr = 0.1, 
+     plot.groups = list(c("TBinLTBI","TBinRSTR"),
+                        c("RSTRinMEDIA","RSTRinTB")),
+     width=10, height=5)
+```
+
+#### Curated gene sets (C2 CP)
+
+```{r c2, warnings=FALSE, message=FALSE}
+GSEA(gene_list = FC.ls, nperm=10000,
+     outdir="results/GSEA/", plotdir="figs/GSEA/",
+     gmt_file="data_clean/Broad.gene.sets/c2.cp.v7.2.symbols.gmt", 
+     plot = TRUE, plot.fdr = 0.1, 
+     plot.groups = list(c("TBinLTBI","TBinRSTR"),
+                        c("RSTRinMEDIA","RSTRinTB")),
+     width=20, height=10)
+```
+
+#### Basic gene sets (C5)
+
+```{r c5, warnings=FALSE, message=FALSE}
+GSEA(gene_list = FC.ls, nperm=10000,
+     outdir="results/GSEA/", plotdir="figs/GSEA/",
+     gmt_file="data_clean/Broad.gene.sets/c5.go.v7.2.symbols.gmt",
+     plot = TRUE, plot.fdr = 0.1, 
+     plot.groups = list(c("TBinLTBI","TBinRSTR"),
+                        c("RSTRinMEDIA","RSTRinTB")),
+     width=20, height=30)
+```
+
+#### Xue et al modules
+
+```{r}
+#load genes in modules from Xue et al
+library(readxl)
+xue <- read_excel("data_raw/Xue/mmc3.xlsx", sheet="Table S2B", skip=3) %>% 
+  pivot_longer(-Genes, values_to = "symbol") %>% 
+  mutate(module=ifelse(as.numeric(name) <= 9, 
+                       paste("0", name, sep=""),name),
+         module=paste("module", module, sep="_")) %>% 
+  dplyr::select(module, symbol) %>% 
+  drop_na(symbol)
+
+#format to list like Broad GMT
+xue.ls <- list()
+
+for(mod in unique(xue$module)){
+  temp <- xue %>% 
+    filter(module == mod) %>% 
+    distinct(symbol) %>% unlist(use.names = FALSE)
+  xue.ls[[mod]] <- temp
+}
+```
+
+```{r xue, warnings=FALSE, message=FALSE}
+GSEA(gene_list = FC.ls, nperm=10000,
+     outdir="results/GSEA/", plotdir="figs/GSEA/",
+     gmt_ls=xue.ls, name="Xue.modules", 
+     plot = TRUE, plot.fdr = 0.1, 
+     plot.groups = list(c("TBinLTBI","TBinRSTR"),
+                        c("RSTRinMEDIA","RSTRinTB")),
+     width=10, height=5)
+```
+
+#### GSEA summary
+
+FDR < 0.1 for RSTR vs LTBI in media and/or +Mtb **AND** for Mtb in RSTR and/or LTBI
+
+```{r echo=FALSE}
+GSEA.all <- mutate(h_GSEA.result, set="H") %>% 
+  bind_rows(mutate(c2_GSEA.result, set="C2")) %>% 
+  bind_rows(mutate(c5_GSEA.result, set="C5")) %>% 
+  bind_rows(mutate(GSEA.result, set="Xue"))
+
+GSEA.toPlot1 <- GSEA.all %>% 
+  filter(group %in% c("RSTRinMEDIA","RSTRinTB") &
+           fgsea.FDR <= 0.1) %>% 
+  distinct(pathway) %>% unlist(use.names = FALSE)
+
+GSEA.toPlot2 <- GSEA.all %>% 
+  filter(group %in% c("TBinLTBI","TBinRSTR") &
+           fgsea.FDR <= 0.1) %>% 
+  distinct(pathway) %>% unlist(use.names = FALSE)
+
+plot.dat <- GSEA.all %>% 
+    #Significant terms
+    filter(pathway %in% intersect(GSEA.toPlot1, GSEA.toPlot2))
+
+plot.dat %>% 
+  distinct(pathway, set) %>% 
+  count(set) %>% 
+  kable(col.names = c("Gene set", "Terms FDR < 0.1 for both TB and RSTR")) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+Significant terms for H
+
+```{r echo=FALSE, fig.width=8.5, fig.height=7}
+#Enrichment score limits
+plot.lim <- max(abs(plot.dat$fgsea.NES))+0.15
+
+#facet labels
+facet_lab <- c('RSTRinMEDIA'="Down in RSTR <-  -> Up in RSTR  \n in media",
+               'RSTRinTB'="Down in RSTR <-  -> Up in RSTR  \n in +Mtb",
+               'TBinLTBI'="Down in +Mtb <-  -> Up in +Mtb  \n in LTBI",
+               'TBinRSTR'="Down in +Mtb <-  -> Up in +Mtb  \n in RSTR",
+               'H'="Hallmark",
+               'C2'="C2 canonical",
+               'C5'="C5 GO",
+               "Xue"="Xue modules")
+
+plot <- plot.dat %>% 
+       filter(set=="H") %>% 
+       #color by significance
+       mutate(Significance = ifelse(fgsea.FDR <= 0.1, "FDR < 0.1",
+                                 "NS")) %>% 
+       #Beautify labels
+       mutate(pathway = gsub("HALLMARK_","",pathway)) %>% 
+       mutate(pathway = factor(pathway, 
+                          levels=c(# = overlap Uganda
+                            
+                            "MYC_TARGETS_V2",
+                            "FATTY_ACID_METABOLISM",
+                            "OXIDATIVE_PHOSPHORYLATION",#
+                            "ADIPOGENESIS",#
+                            
+                            "COAGULATION",#
+                            
+                            "CHOLESTEROL_HOMEOSTASIS",
+                            "G2M_CHECKPOINT",
+                            
+                            "MYOGENESIS",
+                            "KRAS_SIGNALING_DN",#
+                            "TNFA_SIGNALING_VIA_NFKB",#
+                            "INFLAMMATORY_RESPONSE",#
+                            "IL2_STAT5_SIGNALING",#
+                            "EPITHELIAL_MESENCHYMAL_TRANSITION",#
+                            "ALLOGRAFT_REJECTION",#
+                            "INTERFERON_GAMMA_RESPONSE",#
+                            "INTERFERON_ALPHA_RESPONSE",#
+                            
+                            "HYPOXIA"#
+                            ))) %>%                                                          
+    ggplot(aes(pathway, fgsea.NES)) +
+    geom_segment(aes(pathway, xend=pathway, y=0, yend=fgsea.NES)) 
+
+plot.format <- plot +
+       geom_point(size=3, aes(fill = Significance),
+               shape=21, stroke=1) +
+       geom_hline(yintercept = 0) +
+
+       scale_fill_manual(values=c("FDR < 0.1"="#fdae61",
+                                  "NS"="grey")) +
+       lims(y=c(-plot.lim,plot.lim)) +
+       coord_flip() +
+       labs(x="Pathway", y="Normalized Enrichment Score",
+         fill = "FGSEA significance") + 
+       facet_grid(set ~ group, scales="free_y", 
+               labeller = as_labeller(facet_lab),
+               space = "free_y") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+    
+plot.format
+ggsave(filename="figs/GSEA/H_GSEA.result_clean.pdf",
+       plot.format,
+       width = 12, height=8)
+```
+
+Additional heatmap for significant Xue modules
+
+```{r echo=FALSE, message=FALSE}
+corr <- read_excel("data_raw/Xue/mmc3.xlsx", sheet="Table S2A", skip=2) %>% 
+  dplyr::select(-Modulename) %>% 
+  mutate(module=ifelse(`Module ID` <= 9, 
+                       paste("0", `Module ID`, sep=""),`Module ID`),
+         module=paste("module", module, sep="_"),
+         module=factor(module, levels=rev(c("module_42","module_41",
+                                   "module_16","module_06",
+                                   "module_39","module_26",
+                                   "module_07","module_30",
+                                   "module_32","module_09",
+                                   "module_21")))) %>% 
+  filter(module %in% intersect(GSEA.toPlot1, GSEA.toPlot2)) %>% 
+  dplyr::select(-"Module ID") %>% 
+  rename_all(~gsub("γ","g",.)) %>% 
+  rename_all(~gsub("β","B",.)) %>% 
+  arrange(module)
+
+#Extract P-values
+corr.P <- corr %>% 
+  mutate(across(-module, ~str_match(., pattern = "\\(.*?\\)"))) %>% 
+  mutate(across(-module, ~gsub("\\(|\\)","",.)))  %>% 
+  mutate(across(-module, ~as.numeric(.))) %>% 
+  column_to_rownames("module") %>% 
+  as.matrix()
+#Extract R-values
+corr.R <- corr %>% 
+  mutate(across(-module, ~gsub("\\(.*?\\)","",.))) %>% 
+  mutate(across(-module, ~as.numeric(.))) %>% 
+  column_to_rownames("module") %>% 
+  as.matrix()
+```
+
+```{r echo=FALSE, message=FALSE}
+library(corrplot)
+
+corrplot(as.matrix(corr.R), method="color", order="original",
+             #Reverse color order from default
+             col=colorRampPalette(c("darkblue", "white",
+                                    "darkred"))(20),
+             #Change labels
+             tl.col="black", tl.srt=90, cl.lim=c(-1,1),
+             #Change colorlegend
+             cl.pos="b", cl.length = 5,
+             #Add significant labels
+             p.mat = as.matrix(corr.P), insig = "label_sig",
+             sig.level = c(0.01, 0.05), 
+             pch.cex=0.9, pch.col="white",
+             #Add title
+             title="P *<0.05 **<0.01", 
+             mar = c(0,0,5,0))
+
+pdf(file = "figs/GSEA/Xue.modules.heatmap.pdf",
+    height=5, width=7)
+    
+  corrplot(as.matrix(corr.R), method="color", order="original",
+             #Reverse color order from default
+             col=colorRampPalette(c("darkblue", "white",
+                                    "darkred"))(20),
+             #Change labels
+             tl.col="black", tl.srt=90, cl.lim=c(-1,1),
+             #Change colorlegend
+             cl.pos="b", cl.length = 5,
+             #Add significant labels
+             p.mat = as.matrix(corr.P), insig = "label_sig",
+             sig.level = c(0.01, 0.05), 
+             pch.cex=0.9, pch.col="white",
+             #Add title
+             title="P *<0.05 **<0.01", 
+             mar = c(0,0,5,0))
+    
+    dev.off()
+```
+
+# Gene ontology (GO)
+
+Determine GO gene set enrichment in overall DEG list.
+
+## All DEG
+
+```{r}
+genes <- gene_pval %>% 
+  filter(model=="lme" & variable == "condition:Sample_Group") %>% 
+  distinct(gene, FDR)
+
+DEG1 <- genes %>% 
+  filter(FDR <= fdr.cutoff) %>% 
+  distinct(gene) %>% unlist(use.names = FALSE)
+
+DEG2 <- gene_pval %>% 
+  filter(model=="lme" & variable%in%c("condition","Sample_Group")) %>% 
+  group_by(gene) %>% 
+  summarise(max.FDR = max(FDR, na.rm=TRUE)) %>% 
+  filter(max.FDR <= fdr.cutoff) %>% 
+  distinct(gene) %>% unlist(use.names = FALSE)
+```
+
+```{r}
+#Format to named vector
+genes.vec <- genes %>% 
+  mutate(group = ifelse(gene %in% c(DEG1,DEG2), 1, 0),
+         group = factor(group)) %>% 
+  dplyr::select(group) %>% unlist(use.names=FALSE)
+names(genes.vec) <- genes$gene
+
+#Make topGO object
+GOdata <- new("topGOdata", ontology = "BP",
+               allGenes = genes.vec,
+               annot = annFUN.org, mapping="org.Hs.eg.db", ID = "symbol",
+               nodeSize = 1)
+ 
+#Test enrichment of terms
+test.stat <- new("classicCount", testStatistic = GOFisherTest, name = "Fisher test")
+resultFisher <- getSigGroups(GOdata, test.stat)
+
+#Plot
+#Determine # of signif nodes to plot
+enrichFDR <- p.adjust(score(resultFisher), method="fdr")
+
+node.signif <- sum(enrichFDR <= 0.2)
+```
+
+In total, `r node.signif` gene sets were significantly enriched.
+
+# R session
+
+```{r}
+sessionInfo()
+```
+
+***
