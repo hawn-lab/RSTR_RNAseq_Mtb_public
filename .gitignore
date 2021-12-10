@@ -37,3 +37,20 @@ rsconnect/
 
 # MAC
 *.DS_Store
+
+# Primary data. IRB approval needed - see README
+SAfrica/data_clean/RSTR_SA_counts_voom.csv
+SAfrica/data_clean/RSTR_SA_dat_clean.RData
+SAfrica/data_raw/2020.11.05SA.RSTR_Hawn_metadata.csv
+SAfrica/data_raw/Hawn_SAMacrophage_counts.rds
+SAfrica/data_raw/Hawn_SAMacrophage_counts.txt
+Uganda/data_clean/RSTR_RNAseq_data_combined_clean.RData
+Uganda/data_clean/RSTR_RNAseq_data_combined_uniqueFULLID.RData
+Uganda/data_raw/2020.11.20RSTR_Hawn_metadata.csv
+Uganda/data_raw/combatSeq.counts.RData
+Uganda/data_raw/Hawn_UgandaMacrophage_counts.csv
+Uganda/data_raw/Hawn_UgandaMacrophage_counts.tsv
+Uganda/data_raw/Hawn_UgandaValidation_counts.csv
+Uganda/data_raw/Hawn_UgandaValidation_counts.tsv
+Uganda/data_raw/kinship_Hawn_all.csv
+Uganda/data_raw/scBatch.counts.RData
