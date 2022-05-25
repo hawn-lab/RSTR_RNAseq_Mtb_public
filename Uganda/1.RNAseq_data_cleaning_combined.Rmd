@@ -291,7 +291,7 @@ count.all.pc.combat <- ComBat_seq(count.all.pc.mat,
 save(count.all.pc.combat, file="data_raw/combatSeq.counts.RData")
 ```
 
-Comparing these methods, we see that `Combat-Seq` better corrects for batch effects. It also runs signficantly faster than `scBatch` and allows additional co-variate modeling. Thus, `Combat-Seq` will be used.
+Comparing these methods, we see that `Combat-Seq` better corrects for batch effects. It also runs significantly faster than `scBatch` and allows additional co-variate modeling. Thus, `Combat-Seq` will be used.
 
 ```{r PCA.all, echo=FALSE, warning=FALSE, message=FALSE}
 #Calculate PCA for all data.
