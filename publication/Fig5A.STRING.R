@@ -235,7 +235,7 @@ plot.col <- plot +
                     pie_scale = 0.8) +
     scale_fill_manual(values=color.vec, name="Gene ontology") +
     geom_nodetext(aes(x = V(subgraph)$x, y = V(subgraph)$y,
-                      label=V(subgraph)$symbol), size=3) +
+                      label=V(subgraph)$symbol), size=4) +
     theme_blank() + coord_fixed() +
   theme(legend.position = "bottom", legend.direction = "vertical")
 
