@@ -26,7 +26,7 @@ that may mediate resistance to TST/IGRA conversion and provides therapeutic targ
 enhance host restriction of Mtb intracellular infection.
 Importance
 
-### Data
+### Access raw data
 
 Some data are not provided in this repo. To gain access, please submit a request through the NCBI database of Genotypes and Phenotypes (dbGaP).
 
